@@ -1,12 +1,12 @@
 """
 JNGE Wind and Solar Hybrid Controller RS485 Modbus Interface
-Supports reading operating parameters, system settings, and configuration
+Core library for communication with JNGE MPPT controllers
 """
 
 import serial
 import struct
 import time
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from enum import IntEnum
 
 
@@ -117,7 +117,7 @@ class JNGEController:
                 timeout=self.timeout,
                 inter_byte_timeout=self.inter_byte_timeout
             )
-            time.sleep(0.2)  # Allow port to stabilize
+            time.sleep(0.2)
             self.serial.reset_input_buffer()
             self.serial.reset_output_buffer()
             return True
@@ -167,20 +167,16 @@ class JNGEController:
             return None
         
         try:
-            # Clear buffers before sending
             self.serial.reset_input_buffer()
             self.serial.reset_output_buffer()
             time.sleep(0.01)
             
-            # Send request
             self.serial.write(request)
             if self.debug:
                 print(f"TX: {request.hex(' ')}")
             
-            # Wait for device to process (critical for RS485)
             time.sleep(0.1)
             
-            # Wait for data to be available
             retries = 0
             max_retries = 10
             while self.serial.in_waiting < 3 and retries < max_retries:
@@ -191,7 +187,6 @@ class JNGEController:
                 print("No response from device")
                 return None
             
-            # Read response header (address, function, byte count)
             response = self.serial.read(3)
             if len(response) < 3:
                 print(f"Incomplete response header: got {len(response)} bytes")
@@ -202,14 +197,11 @@ class JNGEController:
             if self.debug:
                 print(f"RX Header: addr={addr:02X} func={func:02X} count={byte_count}")
             
-            # Calculate expected remaining bytes
-            remaining = byte_count + 2  # data bytes + 2 CRC bytes
-            
-            # Read remaining data with timeout protection
+            remaining = byte_count + 2
             data_received = b''
             bytes_to_read = remaining
             timeout_counter = 0
-            max_timeout = 50  # 50 * 0.02 = 1 second max
+            max_timeout = 50
             
             while len(data_received) < bytes_to_read and timeout_counter < max_timeout:
                 if self.serial.in_waiting > 0:
@@ -230,7 +222,6 @@ class JNGEController:
             if self.debug:
                 print(f"RX: {response.hex(' ')}")
             
-            # Verify CRC
             crc_received = struct.unpack('<H', response[-2:])[0]
             crc_calculated = self._calculate_crc16(response[:-2])
             
@@ -248,10 +239,7 @@ class JNGEController:
             return None
     
     def discover_device(self) -> Optional[int]:
-        """
-        Broadcast to discover device address (FF function code)
-        Returns the device address if found
-        """
+        """Broadcast to discover device address (FF function code)"""
         broadcast_frame = struct.pack('>BBHH', 0xFF, 0x03, 0x1030, 0x0001)
         crc = self._calculate_crc16(broadcast_frame)
         broadcast_frame += struct.pack('<H', crc)
@@ -265,7 +253,7 @@ class JNGEController:
             self.serial.write(broadcast_frame)
             time.sleep(0.1)
             
-            response = self.serial.read(7)  # Expected response length
+            response = self.serial.read(7)
             if len(response) >= 7:
                 addr = response[0]
                 print(f"Device found at address: 0x{addr:02X}")
@@ -278,10 +266,7 @@ class JNGEController:
     def read_registers(self, start_reg: int, num_regs: int) -> Optional[List[int]]:
         """Read holding registers (function code 0x03)"""
         request = self._build_request(0x03, start_reg, num_regs)
-        
-        # Add small delay between requests to avoid overwhelming device
         time.sleep(0.05)
-        
         response = self._send_request(request)
         
         if not response:
@@ -290,7 +275,6 @@ class JNGEController:
         byte_count = response[2]
         data = response[3:3+byte_count]
         
-        # Parse 16-bit register values
         values = []
         for i in range(0, len(data), 2):
             if i+1 < len(data):
@@ -302,16 +286,12 @@ class JNGEController:
     def write_register(self, reg_addr: int, value: int) -> bool:
         """Write single register (function code 0x06)"""
         request = self._build_write_request(0x06, reg_addr, value)
-        
-        # Add small delay between requests
         time.sleep(0.05)
-        
         response = self._send_request(request)
         
         if not response:
             return False
         
-        # Verify echo response
         return response[:-2] == request[:-2]
     
     def set_debug(self, debug: bool):
@@ -435,5 +415,3 @@ class JNGEController:
     def enable_load(self, enable: bool) -> bool:
         """Enable/disable load output"""
         return self.write_register(0x103C, 1 if enable else 0)
-
-
