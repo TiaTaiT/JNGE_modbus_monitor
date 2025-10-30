@@ -1,4 +1,5 @@
 """
+file: monitor.py
 Real-time monitoring script for JNGE MPPT Controller
 """
 
@@ -122,13 +123,27 @@ def main():
     print("JNGE MPPT Controller Monitor")
     print(f"Port: {PORT}  |  Address: 0x{ADDRESS:02X}")
     
-    # Initialize controller
-    controller = JNGEController(
-        port=PORT,
-        address=ADDRESS,
-        timeout=1.0,
-        inter_byte_timeout=0.1
-    )
+    # Configuration - choose your connection type
+    USE_TCP = True  # Set to True for TCP, False for Serial
+    
+    if USE_TCP:
+        # TCP configuration
+        controller = JNGEController.create_tcp(
+            host='10.10.100.254',
+            port=8899,
+            address=ADDRESS,
+            timeout=2.0
+        )
+        print("Using TCP connection to 192.168.1.100:502")
+    else:
+        # Serial configuration
+        controller = JNGEController.create_serial(
+            port=PORT,
+            address=ADDRESS,
+            baudrate=9600,
+            timeout=1.0
+        )
+        print("Using Serial connection on COM4")
     
     # Connect
     print("\nConnecting...")

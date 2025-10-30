@@ -1,12 +1,15 @@
 """
+file: jnge_controller.py
 JNGE Wind and Solar Hybrid Controller RS485 Modbus Interface
 Core library for communication with JNGE MPPT controllers
+Supports both Serial (RS485) and TCP communication
 """
 
 import serial
+import socket
 import struct
 import time
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 from enum import IntEnum
 
 
@@ -34,8 +37,13 @@ class OperatingMode(IntEnum):
     STREET_LAMP = 1
 
 
+class ConnectionType(IntEnum):
+    SERIAL = 1
+    TCP = 2
+
+
 class JNGEController:
-    """Interface for JNGE Wind and Solar Hybrid Controller via RS485 Modbus"""
+    """Interface for JNGE Wind and Solar Hybrid Controller via RS485 Modbus or Modbus TCP"""
     
     # Register addresses
     REG_BATTERY_VOLTAGE = 0x1000
@@ -85,27 +93,80 @@ class JNGEController:
         14: "PV array undervoltage (under 6V)"
     }
     
-    def __init__(self, port: str, address: int = 0x06, baudrate: int = 9600, 
-                 timeout: float = 1.0, inter_byte_timeout: float = 0.1):
+    def __init__(self, connection_type: ConnectionType = ConnectionType.SERIAL,
+                 port: Optional[str] = None, baudrate: int = 9600,
+                 host: Optional[str] = None, tcp_port: int = 502,
+                 address: int = 0x06, timeout: float = 1.0, 
+                 inter_byte_timeout: float = 0.1):
         """
         Initialize JNGE Controller interface
         
         Args:
-            port: Serial port name (e.g., 'COM3' or '/dev/ttyUSB0')
+            connection_type: ConnectionType.SERIAL or ConnectionType.TCP
+            port: Serial port name (e.g., 'COM3' or '/dev/ttyUSB0') - for Serial
+            baudrate: Communication baudrate (default: 9600) - for Serial
+            host: IP address or hostname - for TCP
+            tcp_port: TCP port number (default: 502) - for TCP
             address: Modbus device address (default: 0x06)
-            baudrate: Communication baudrate (default: 9600)
-            timeout: Serial timeout in seconds
-            inter_byte_timeout: Timeout between bytes
+            timeout: Connection timeout in seconds
+            inter_byte_timeout: Timeout between bytes (Serial only)
         """
-        self.port = port
+        self.connection_type = connection_type
         self.address = address
-        self.baudrate = baudrate
         self.timeout = timeout
-        self.inter_byte_timeout = inter_byte_timeout
-        self.serial = None
         self.debug = False
         
+        # Serial parameters
+        self.port = port
+        self.baudrate = baudrate
+        self.inter_byte_timeout = inter_byte_timeout
+        self.serial = None
+        
+        # TCP parameters
+        self.host = host
+        self.tcp_port = tcp_port
+        self.socket = None
+        self.transaction_id = 0
+        
+        # Validate configuration
+        if self.connection_type == ConnectionType.SERIAL and not self.port:
+            raise ValueError("Serial port must be specified for Serial connection")
+        if self.connection_type == ConnectionType.TCP and not self.host:
+            raise ValueError("Host must be specified for TCP connection")
+    
+    @classmethod
+    def create_serial(cls, port: str, address: int = 0x06, baudrate: int = 9600,
+                     timeout: float = 1.0, inter_byte_timeout: float = 0.1):
+        """Factory method to create Serial connection"""
+        return cls(
+            connection_type=ConnectionType.SERIAL,
+            port=port,
+            address=address,
+            baudrate=baudrate,
+            timeout=timeout,
+            inter_byte_timeout=inter_byte_timeout
+        )
+    
+    @classmethod
+    def create_tcp(cls, host: str, port: int = 502, address: int = 0x06,
+                  timeout: float = 1.0):
+        """Factory method to create TCP connection"""
+        return cls(
+            connection_type=ConnectionType.TCP,
+            host=host,
+            tcp_port=port,
+            address=address,
+            timeout=timeout
+        )
+    
     def connect(self):
+        """Open connection (Serial or TCP)"""
+        if self.connection_type == ConnectionType.SERIAL:
+            return self._connect_serial()
+        else:
+            return self._connect_tcp()
+    
+    def _connect_serial(self):
         """Open serial connection"""
         try:
             self.serial = serial.Serial(
@@ -125,13 +186,32 @@ class JNGEController:
             print(f"Failed to open serial port: {e}")
             return False
     
+    def _connect_tcp(self):
+        """Open TCP connection"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(self.timeout)
+            self.socket.connect((self.host, self.tcp_port))
+            return True
+        except socket.error as e:
+            print(f"Failed to connect to {self.host}:{self.tcp_port}: {e}")
+            return False
+    
     def disconnect(self):
-        """Close serial connection"""
-        if self.serial and self.serial.is_open:
-            self.serial.close()
+        """Close connection"""
+        if self.connection_type == ConnectionType.SERIAL:
+            if self.serial and self.serial.is_open:
+                self.serial.close()
+        else:
+            if self.socket:
+                try:
+                    self.socket.close()
+                except:
+                    pass
+                self.socket = None
     
     def _calculate_crc16(self, data: bytes) -> int:
-        """Calculate CRC16 for Modbus"""
+        """Calculate CRC16 for Modbus RTU"""
         crc = 0xFFFF
         for byte in data:
             crc ^= byte
@@ -142,26 +222,50 @@ class JNGEController:
                     crc >>= 1
         return crc
     
-    def _build_request(self, function_code: int, start_reg: int, 
-                      num_regs: int) -> bytes:
-        """Build Modbus request frame"""
+    def _build_mbap_header(self, pdu_length: int) -> bytes:
+        """Build Modbus TCP MBAP header"""
+        self.transaction_id = (self.transaction_id + 1) & 0xFFFF
+        protocol_id = 0x0000
+        unit_id = self.address
+        
+        # Transaction ID (2), Protocol ID (2), Length (2), Unit ID (1)
+        return struct.pack('>HHHB', self.transaction_id, protocol_id, 
+                          pdu_length + 1, unit_id)
+    
+    def _build_request_serial(self, function_code: int, start_reg: int, 
+                             num_regs: int) -> bytes:
+        """Build Modbus RTU request frame"""
         frame = struct.pack('>BBHH', self.address, function_code, 
                            start_reg, num_regs)
         crc = self._calculate_crc16(frame)
         frame += struct.pack('<H', crc)
         return frame
     
-    def _build_write_request(self, function_code: int, reg_addr: int, 
-                            value: int) -> bytes:
-        """Build Modbus write request frame"""
+    def _build_request_tcp(self, function_code: int, start_reg: int,
+                          num_regs: int) -> bytes:
+        """Build Modbus TCP request frame"""
+        pdu = struct.pack('>BHH', function_code, start_reg, num_regs)
+        mbap = self._build_mbap_header(len(pdu))
+        return mbap + pdu
+    
+    def _build_write_request_serial(self, function_code: int, reg_addr: int, 
+                                   value: int) -> bytes:
+        """Build Modbus RTU write request frame"""
         frame = struct.pack('>BBHH', self.address, function_code, 
                            reg_addr, value)
         crc = self._calculate_crc16(frame)
         frame += struct.pack('<H', crc)
         return frame
     
-    def _send_request(self, request: bytes) -> Optional[bytes]:
-        """Send request and receive response"""
+    def _build_write_request_tcp(self, function_code: int, reg_addr: int,
+                                value: int) -> bytes:
+        """Build Modbus TCP write request frame"""
+        pdu = struct.pack('>BHH', function_code, reg_addr, value)
+        mbap = self._build_mbap_header(len(pdu))
+        return mbap + pdu
+    
+    def _send_request_serial(self, request: bytes) -> Optional[bytes]:
+        """Send request and receive response via Serial"""
         if not self.serial or not self.serial.is_open:
             print("Serial port not open")
             return None
@@ -238,8 +342,116 @@ class JNGEController:
             print(f"Unexpected error: {e}")
             return None
     
+    def _send_request_tcp(self, request: bytes) -> Optional[bytes]:
+        """Send request and receive response via TCP"""
+        if not self.socket:
+            print("TCP socket not connected")
+            return None
+        
+        try:
+            self.socket.sendall(request)
+            if self.debug:
+                print(f"TX: {request.hex(' ')}")
+            
+            # Read MBAP header (7 bytes)
+            header = self._recv_exact(7)
+            if not header:
+                return None
+            
+            trans_id, proto_id, length, unit_id = struct.unpack('>HHHB', header)
+            
+            if self.debug:
+                print(f"RX Header: trans_id={trans_id:04X} proto={proto_id:04X} len={length} unit={unit_id:02X}")
+            
+            # Read PDU (length includes unit_id which we already read)
+            pdu = self._recv_exact(length - 1)
+            if not pdu:
+                return None
+            
+            response = header + pdu
+            
+            if self.debug:
+                print(f"RX: {response.hex(' ')}")
+            
+            return response
+            
+        except socket.error as e:
+            print(f"TCP communication error: {e}")
+            return None
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            return None
+    
+    def _recv_exact(self, num_bytes: int) -> Optional[bytes]:
+        """Receive exact number of bytes from TCP socket"""
+        if not self.socket:
+            print("TCP socket not connected")
+            return None
+            
+        data = b''
+        while len(data) < num_bytes:
+            try:
+                chunk = self.socket.recv(num_bytes - len(data))
+                if not chunk:
+                    print("Connection closed by remote host")
+                    return None
+                data += chunk
+            except socket.timeout:
+                print("TCP receive timeout")
+                return None
+            except socket.error as e:
+                print(f"Socket error: {e}")
+                return None
+        return data
+    
+    def _send_request(self, request: bytes) -> Optional[bytes]:
+        """Send request and receive response (auto-select Serial or TCP)"""
+        if self.connection_type == ConnectionType.SERIAL:
+            return self._send_request_serial(request)
+        else:
+            return self._send_request_tcp(request)
+    
+    def _build_request(self, function_code: int, start_reg: int, 
+                      num_regs: int) -> bytes:
+        """Build request frame (auto-select Serial or TCP)"""
+        if self.connection_type == ConnectionType.SERIAL:
+            return self._build_request_serial(function_code, start_reg, num_regs)
+        else:
+            return self._build_request_tcp(function_code, start_reg, num_regs)
+    
+    def _build_write_request(self, function_code: int, reg_addr: int, 
+                            value: int) -> bytes:
+        """Build write request frame (auto-select Serial or TCP)"""
+        if self.connection_type == ConnectionType.SERIAL:
+            return self._build_write_request_serial(function_code, reg_addr, value)
+        else:
+            return self._build_write_request_tcp(function_code, reg_addr, value)
+    
+    def _parse_response(self, response: bytes) -> Optional[List[int]]:
+        """Parse response data (handles both Serial and TCP)"""
+        if self.connection_type == ConnectionType.SERIAL:
+            # RTU format: [addr][func][count][data...][crc_lo][crc_hi]
+            byte_count = response[2]
+            data = response[3:3+byte_count]
+        else:
+            # TCP format: [mbap_header][func][count][data...]
+            byte_count = response[8]  # 7 bytes MBAP + 1 byte func
+            data = response[9:9+byte_count]
+        
+        values = []
+        for i in range(0, len(data), 2):
+            if i+1 < len(data):
+                value = struct.unpack('>H', data[i:i+2])[0]
+                values.append(value)
+        
+        return values
+    
     def discover_device(self) -> Optional[int]:
-        """Broadcast to discover device address (FF function code)"""
+        """Broadcast to discover device address (Serial only, FF function code)"""
+        if self.connection_type != ConnectionType.SERIAL:
+            print("Device discovery only supported on Serial connection")
+            return None
+        
         broadcast_frame = struct.pack('>BBHH', 0xFF, 0x03, 0x1030, 0x0001)
         crc = self._calculate_crc16(broadcast_frame)
         broadcast_frame += struct.pack('<H', crc)
@@ -272,16 +484,7 @@ class JNGEController:
         if not response:
             return None
         
-        byte_count = response[2]
-        data = response[3:3+byte_count]
-        
-        values = []
-        for i in range(0, len(data), 2):
-            if i+1 < len(data):
-                value = struct.unpack('>H', data[i:i+2])[0]
-                values.append(value)
-        
-        return values
+        return self._parse_response(response)
     
     def write_register(self, reg_addr: int, value: int) -> bool:
         """Write single register (function code 0x06)"""
@@ -292,7 +495,12 @@ class JNGEController:
         if not response:
             return False
         
-        return response[:-2] == request[:-2]
+        # Verify echo response
+        if self.connection_type == ConnectionType.SERIAL:
+            return response[:-2] == request[:-2]
+        else:
+            # TCP: compare PDU part
+            return response[7:] == request[7:]
     
     def set_debug(self, debug: bool):
         """Enable/disable debug output"""
